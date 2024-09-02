@@ -7,8 +7,21 @@ from gpt2_dataloader import DataLoaderLite
 import math
 
 # -------------------------------------------------------------
+# set random seed
+torch.manual_seed(1337)
+torch.cuda.manual_seed(1337)
+
+# gradient accumulation
+total_batch_size = 524288 # 2^19, in num of tokens
+B = 16
+T = 1024
+assert total_batch_size % (B * T) == 0
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> gradient accumulation steps: {grad_accum_steps}")
+
 # create the data loader
-train_loader = DataLoaderLite(16, 1024)
+train_loader = DataLoaderLite(B, T)
 
 torch.set_float32_matmul_precision("high")
 
@@ -41,11 +54,18 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr)
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
     optimizer.zero_grad()
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    # gradient accumulation
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+
+    # clip the gradients
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # learning rate schedule
@@ -57,7 +77,7 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    print(f"step {step:4d} | loss {loss.item():.6f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt:.2f}ms")
+    print(f"step {step:4d} | loss {loss_accum.item():.6f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt:.2f}ms")
 
 import sys; sys.exit()
 
