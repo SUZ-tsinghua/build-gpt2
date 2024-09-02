@@ -4,25 +4,60 @@ import torch.nn as nn
 from torch.nn import functional as F
 from gpt2_model import GPT2, GPT2Config
 from gpt2_dataloader import DataLoaderLite
+import math
 
 # -------------------------------------------------------------
 # create the data loader
-train_loader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(16, 1024)
+
+torch.set_float32_matmul_precision("high")
 
 # create the model
-model = GPT2(GPT2Config)
+model = GPT2(GPT2Config(vocab_size=50304))
 model.to("cuda")
 model.train()
+model = torch.compile(model)
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(step):
+    # 1) linear warmup for warmup_steps
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    # 2) 
+    if step > max_steps:
+        return min_lr
+    # 3) cosine annealing from max_lr to min_lr
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(decay_ratio * math.pi))
+    return min_lr + (max_lr - min_lr) * coeff
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+import time
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr)
+
+for step in range(max_steps):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    # learning rate schedule
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    
     optimizer.step()
-    print(f"step {i}, loss {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    print(f"step {step:4d} | loss {loss.item():.6f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt:.2f}ms")
 
 import sys; sys.exit()
 

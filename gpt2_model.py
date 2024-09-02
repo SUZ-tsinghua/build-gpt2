@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import inspect
 
 @dataclass
 class GPT2Config:
@@ -40,10 +41,15 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, C // n_head)
 
         # causal self-attention
-        attn = (q @ k.transpose(-2, -1)) * (1.0 / (C // self.n_head) ** 0.5) # (B, n_head, T, T)
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # mask out the upper half of the matrix
-        attn = F.softmax(attn, dim=-1)
-        y = attn @ v # (B, n_head, T, C // n_head)
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / (C // self.n_head) ** 0.5) # (B, n_head, T, T)
+        # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # mask out the upper half of the matrix
+        # attn = F.softmax(attn, dim=-1)
+        # y = attn @ v # (B, n_head, T, C // n_head)
+
+        # use flash attention to accelerate
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # (B, n_head, T, C // n_head)
+
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
 
         # output projection
@@ -178,3 +184,28 @@ class GPT2(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate):
+        # start with all of the candidate parameters (that require gradients)
+        param_dict = {k: v for k, v in self.named_parameters() if v.requires_grad}
+
+        # create optim groups. Any parameters that are 2D will by weight decayed, otherwise not
+        # i.e., weight decay is applied to W and not to b
+        decay_params = [v for k, v in param_dict.items() if v.dim() >= 2]
+        nodecay_params = [v for k, v in param_dict.items() if v.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+
+        # print 
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        # create AdamW optimizer and use the fused version if available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        print(f"using fused AdamW: {fused_available}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused_available)
+        return optimizer
