@@ -185,7 +185,7 @@ class GPT2(nn.Module):
         
         return model
     
-    def configure_optimizers(self, weight_decay, learning_rate):
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all of the candidate parameters (that require gradients)
         param_dict = {k: v for k, v in self.named_parameters() if v.requires_grad}
 
@@ -206,6 +206,7 @@ class GPT2(nn.Module):
 
         # create AdamW optimizer and use the fused version if available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        print(f"using fused AdamW: {fused_available}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused_available)
+        use_fused = fused_available and device_type == "cuda"
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
